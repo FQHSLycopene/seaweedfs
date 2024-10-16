@@ -75,4 +75,4 @@ available at [http://contributor-covenant.org/version/1/4][version]
 
 test message
 
-test conflict 2
+conflict test 
