@@ -1,6 +1,7 @@
 package filer
 
 import (
+	"context"
 	"io"
 	"sync"
 
@@ -56,6 +57,9 @@ func (group *ChunkGroup) ReadDataAt(fileSize int64, buff []byte, offset int64) (
 	for si := sectionIndexStart; si < sectionIndexStop+1; si++ {
 		section, found := group.sections[si]
 		rangeStart, rangeStop := max(offset, int64(si*SectionSize)), min(offset+int64(len(buff)), int64((si+1)*SectionSize))
+		if rangeStart >= rangeStop {
+			continue
+		}
 		if !found {
 			rangeStop = min(rangeStop, fileSize)
 			for i := rangeStart; i < rangeStop; i++ {
@@ -66,7 +70,7 @@ func (group *ChunkGroup) ReadDataAt(fileSize int64, buff []byte, offset int64) (
 		}
 		xn, xTsNs, xErr := section.readDataAt(group, fileSize, buff[rangeStart-offset:rangeStop-offset], rangeStart)
 		if xErr != nil {
-			err = xErr
+			return n + xn, max(tsNs, xTsNs), xErr
 		}
 		n += xn
 		tsNs = max(tsNs, xTsNs)
@@ -86,7 +90,7 @@ func (group *ChunkGroup) SetChunks(chunks []*filer_pb.FileChunk) error {
 			continue
 		}
 
-		resolvedChunks, err := ResolveOneChunkManifest(group.lookupFn, chunk)
+		resolvedChunks, err := ResolveOneChunkManifest(context.Background(), group.lookupFn, chunk)
 		if err != nil {
 			return err
 		}

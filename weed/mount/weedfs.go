@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -42,10 +44,12 @@ type Option struct {
 	CacheDirForRead    string
 	CacheSizeMBForRead int64
 	CacheDirForWrite   string
+	CacheMetaTTlSec    int
 	DataCenter         string
 	Umask              os.FileMode
 	Quota              int64
 	DisableXAttr       bool
+	IsMacOs            bool
 
 	MountUid         uint32
 	MountGid         uint32
@@ -68,19 +72,21 @@ type WFS struct {
 	fuse.RawFileSystem
 	mount_pb.UnimplementedSeaweedMountServer
 	fs.Inode
-	option            *Option
-	metaCache         *meta_cache.MetaCache
-	stats             statsCache
-	chunkCache        *chunk_cache.TieredChunkCache
-	signature         int32
-	concurrentWriters *util.LimitedConcurrentExecutor
-	inodeToPath       *InodeToPath
-	fhMap             *FileHandleToInode
-	dhMap             *DirectoryHandleToInode
-	fuseServer        *fuse.Server
-	IsOverQuota       bool
-	fhLockTable       *util.LockTable[FileHandleId]
-	FilerConf         *filer.FilerConf
+	option               *Option
+	metaCache            *meta_cache.MetaCache
+	stats                statsCache
+	chunkCache           *chunk_cache.TieredChunkCache
+	signature            int32
+	concurrentWriters    *util.LimitedConcurrentExecutor
+	copyBufferPool       sync.Pool
+	concurrentCopiersSem chan struct{}
+	inodeToPath          *InodeToPath
+	fhMap                *FileHandleToInode
+	dhMap                *DirectoryHandleToInode
+	fuseServer           *fuse.Server
+	IsOverQuota          bool
+	fhLockTable          *util.LockTable[FileHandleId]
+	FilerConf            *filer.FilerConf
 }
 
 func NewSeaweedFileSystem(option *Option) *WFS {
@@ -88,7 +94,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		RawFileSystem: fuse.NewDefaultRawFileSystem(),
 		option:        option,
 		signature:     util.RandomInt32(),
-		inodeToPath:   NewInodeToPath(util.FullPath(option.FilerMountRootPath)),
+		inodeToPath:   NewInodeToPath(util.FullPath(option.FilerMountRootPath), option.CacheMetaTTlSec),
 		fhMap:         NewFileHandleToInode(),
 		dhMap:         NewDirectoryHandleToInode(),
 		fhLockTable:   util.NewLockTable[FileHandleId](),
@@ -136,20 +142,22 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 
 	if wfs.option.ConcurrentWriters > 0 {
 		wfs.concurrentWriters = util.NewLimitedConcurrentExecutor(wfs.option.ConcurrentWriters)
+		wfs.concurrentCopiersSem = make(chan struct{}, wfs.option.ConcurrentWriters)
+	}
+	wfs.copyBufferPool.New = func() any {
+		return make([]byte, option.ChunkSizeLimit)
 	}
 	return wfs
 }
 
 func (wfs *WFS) StartBackgroundTasks() error {
-	fn, err := wfs.subscribeFilerConfEvents()
+	follower, err := wfs.subscribeFilerConfEvents()
 	if err != nil {
 		return err
 	}
 
-	go fn()
-
 	startTime := time.Now()
-	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano())
+	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano(), follower)
 	go wfs.loopCheckQuota()
 
 	return nil
@@ -182,7 +190,6 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 }
 
 func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.Status) {
-
 	// glog.V(3).Infof("read entry cache miss %s", fullpath)
 	dir, name := fullpath.DirAndName()
 
@@ -212,7 +219,7 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.St
 
 func (wfs *WFS) LookupFn() wdclient.LookupFileIdFunctionType {
 	if wfs.option.VolumeServerAccess == "filerProxy" {
-		return func(fileId string) (targetUrls []string, err error) {
+		return func(ctx context.Context, fileId string) (targetUrls []string, err error) {
 			return []string{"http://" + wfs.getCurrentFiler().ToHttpAddress() + "/?proxyChunkId=" + fileId}, nil
 		}
 	}
@@ -224,8 +231,14 @@ func (wfs *WFS) getCurrentFiler() pb.ServerAddress {
 	return wfs.option.FilerAddresses[i]
 }
 
+func (wfs *WFS) ClearCacheDir() {
+	wfs.metaCache.Shutdown()
+	os.RemoveAll(wfs.option.getUniqueCacheDirForWrite())
+	os.RemoveAll(wfs.option.getUniqueCacheDirForRead())
+}
+
 func (option *Option) setupUniqueCacheDirectory() {
-	cacheUniqueId := util.Md5String([]byte(option.MountDirectory + string(option.FilerAddresses[0]) + option.FilerMountRootPath + util.Version()))[0:8]
+	cacheUniqueId := util.Md5String([]byte(option.MountDirectory + string(option.FilerAddresses[0]) + option.FilerMountRootPath + version.Version()))[0:8]
 	option.uniqueCacheDirForRead = path.Join(option.CacheDirForRead, cacheUniqueId)
 	os.MkdirAll(option.uniqueCacheDirForRead, os.FileMode(0777)&^option.Umask)
 	option.uniqueCacheDirForWrite = filepath.Join(path.Join(option.CacheDirForWrite, cacheUniqueId), "swap")

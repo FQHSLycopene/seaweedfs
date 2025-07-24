@@ -6,15 +6,15 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
+
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
-	"github.com/seaweedfs/seaweedfs/weed/util"
-
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -49,6 +49,7 @@ func (vs *VolumeServer) AllocateVolume(ctx context.Context, req *volume_server_p
 		req.Replication,
 		req.Ttl,
 		req.Preallocate,
+		needle.Version(req.Version),
 		req.MemoryMapMaxSizeMb,
 		types.ToDiskType(req.DiskType),
 		vs.ldbTimout,
@@ -164,7 +165,7 @@ func (vs *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_serv
 	// rare case 1.5: it will be unlucky if heartbeat happened between step 1 and 2.
 
 	// step 2: mark local volume as readonly
-	err := vs.store.MarkVolumeReadonly(needle.VolumeId(req.VolumeId))
+	err := vs.store.MarkVolumeReadonly(needle.VolumeId(req.VolumeId), req.GetPersist())
 
 	if err != nil {
 		glog.Errorf("volume mark readonly %v: %v", req, err)
@@ -253,7 +254,7 @@ func (vs *VolumeServer) VolumeServerStatus(ctx context.Context, req *volume_serv
 
 	resp := &volume_server_pb.VolumeServerStatusResponse{
 		MemoryStatus: stats.MemStat(),
-		Version:      util.Version(),
+		Version:      version.Version(),
 		DataCenter:   vs.dataCenter,
 		Rack:         vs.rack,
 	}

@@ -60,7 +60,7 @@ func (c *commandVolumeFsck) Name() string {
 }
 
 func (c *commandVolumeFsck) Help() string {
-	return `check all volumes to find entries not used by the filer
+	return `check all volumes to find entries not used by the filer. It is optional and resource intensive.
 
 	Important assumption!!!
 		the system is all used by one filer.
@@ -77,6 +77,10 @@ func (c *commandVolumeFsck) Help() string {
 	3. find out the set B subtract A
 
 `
+}
+
+func (c *commandVolumeFsck) HasTag(tag CommandTag) bool {
+	return tag == ResourceHeavy
 }
 
 func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -116,13 +120,13 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 
 	c.bucketsPath, err = readFilerBucketsPath(commandEnv)
 	if err != nil {
-		return fmt.Errorf("read filer buckets path: %v", err)
+		return fmt.Errorf("read filer buckets path: %w", err)
 	}
 
 	// create a temp folder
 	c.tempFolder, err = os.MkdirTemp(*tempPath, "sw_fsck")
 	if err != nil {
-		return fmt.Errorf("failed to create temp folder: %v", err)
+		return fmt.Errorf("failed to create temp folder: %w", err)
 	}
 	if *c.verbose {
 		fmt.Fprintf(c.writer, "working directory: %s\n", c.tempFolder)
@@ -132,11 +136,11 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 	// collect all volume id locations
 	dataNodeVolumeIdToVInfo, err := c.collectVolumeIds()
 	if err != nil {
-		return fmt.Errorf("failed to collect all volume locations: %v", err)
+		return fmt.Errorf("failed to collect all volume locations: %w", err)
 	}
 
 	if err != nil {
-		return fmt.Errorf("read filer buckets path: %v", err)
+		return fmt.Errorf("read filer buckets path: %w", err)
 	}
 
 	var collectCutoffFromAtNs int64 = 0
@@ -185,22 +189,22 @@ func (c *commandVolumeFsck) Do(args []string, commandEnv *CommandEnv, writer io.
 		// collect all filer file ids and paths
 
 		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, *purgeAbsent, collectModifyFromAtNs, collectCutoffFromAtNs); err != nil {
-			return fmt.Errorf("collectFilerFileIdAndPaths: %v", err)
+			return fmt.Errorf("collectFilerFileIdAndPaths: %w", err)
 		}
 		for dataNodeId, volumeIdToVInfo := range dataNodeVolumeIdToVInfo {
 			// for each volume, check filer file ids
 			if err = c.findFilerChunksMissingInVolumeServers(volumeIdToVInfo, dataNodeId, *applyPurging); err != nil {
-				return fmt.Errorf("findFilerChunksMissingInVolumeServers: %v", err)
+				return fmt.Errorf("findFilerChunksMissingInVolumeServers: %w", err)
 			}
 		}
 	} else {
 		// collect all filer file ids
 		if err = c.collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo, false, 0, 0); err != nil {
-			return fmt.Errorf("failed to collect file ids from filer: %v", err)
+			return fmt.Errorf("failed to collect file ids from filer: %w", err)
 		}
 		// volume file ids subtract filer file ids
 		if err = c.findExtraChunksInVolumeServers(dataNodeVolumeIdToVInfo, *applyPurging, uint64(collectModifyFromAtNs), uint64(collectCutoffFromAtNs)); err != nil {
-			return fmt.Errorf("findExtraChunksInVolumeServers: %v", err)
+			return fmt.Errorf("findExtraChunksInVolumeServers: %w", err)
 		}
 	}
 
@@ -236,7 +240,7 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 			if *c.verbose && entry.Entry.IsDirectory {
 				fmt.Fprintf(c.writer, "checking directory %s\n", util.NewFullPath(entry.Dir, entry.Entry.Name))
 			}
-			dataChunks, manifestChunks, resolveErr := filer.ResolveChunkManifest(filer.LookupFn(c.env), entry.Entry.GetChunks(), 0, math.MaxInt64)
+			dataChunks, manifestChunks, resolveErr := filer.ResolveChunkManifest(context.Background(), filer.LookupFn(c.env), entry.Entry.GetChunks(), 0, math.MaxInt64)
 			if resolveErr != nil {
 				return fmt.Errorf("failed to ResolveChunkManifest: %+v", resolveErr)
 			}
@@ -359,12 +363,12 @@ func (c *commandVolumeFsck) findExtraChunksInVolumeServers(dataNodeVolumeIdToVIn
 				needleVID := needle.VolumeId(volumeId)
 
 				if isReadOnlyReplicas[volumeId] {
-					err := markVolumeWritable(c.env.option.GrpcDialOption, needleVID, server, true)
+					err := markVolumeWritable(c.env.option.GrpcDialOption, needleVID, server, true, false)
 					if err != nil {
 						return fmt.Errorf("mark volume %d read/write: %v", volumeId, err)
 					}
 					fmt.Fprintf(c.writer, "temporarily marked %d on server %v writable for forced purge\n", volumeId, server)
-					defer markVolumeWritable(c.env.option.GrpcDialOption, needleVID, server, false)
+					defer markVolumeWritable(c.env.option.GrpcDialOption, needleVID, server, false, false)
 
 					fmt.Fprintf(c.writer, "marked %d on server %v writable for forced purge\n", volumeId, server)
 				}
@@ -647,7 +651,7 @@ func (c *commandVolumeFsck) collectVolumeIds() (volumeIdToServer map[string]map[
 		return
 	}
 
-	eachDataNode(topologyInfo, func(dc string, rack RackId, t *master_pb.DataNodeInfo) {
+	eachDataNode(topologyInfo, func(dc DataCenterId, rack RackId, t *master_pb.DataNodeInfo) {
 		var volumeCount, ecShardCount int
 		dataNodeId := t.GetId()
 		for _, diskInfo := range t.DiskInfos {

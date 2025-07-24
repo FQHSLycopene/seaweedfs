@@ -3,9 +3,11 @@ package weed_server
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
-	"time"
 
 	"github.com/seaweedfs/raft"
 
@@ -58,6 +60,7 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 	}
 	diskType := types.ToDiskType(req.DiskType)
 
+	ver := needle.GetCurrentVersion()
 	option := &topology.VolumeGrowOption{
 		Collection:         req.Collection,
 		ReplicaPlacement:   replicaPlacement,
@@ -68,6 +71,7 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 		Rack:               req.Rack,
 		DataNode:           req.DataNode,
 		MemoryMapMaxSizeMb: req.MemoryMapMaxSizeMb,
+		Version:            uint32(ver),
 	}
 
 	if !ms.Topo.DataCenterExists(option.DataCenter) {
@@ -100,6 +104,9 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 			glog.V(1).Infof("assign %v %v: %v", req, option.String(), err)
 			stats.MasterPickForWriteErrorCounter.Inc()
 			lastErr = err
+			if (req.DataCenter != "" || req.Rack != "") && strings.Contains(err.Error(), topology.NoWritableVolumes) {
+				break
+			}
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}

@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/exp/slices"
+	"slices"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -121,12 +121,12 @@ func (l *DiskLocation) loadEcShards(shards []string, collection string, vid need
 	for _, shard := range shards {
 		shardId, err := strconv.ParseInt(path.Ext(shard)[3:], 10, 64)
 		if err != nil {
-			return fmt.Errorf("failed to parse ec shard name %v: %v", shard, err)
+			return fmt.Errorf("failed to parse ec shard name %v: %w", shard, err)
 		}
 
 		_, err = l.LoadEcShard(collection, vid, erasure_coding.ShardId(shardId))
 		if err != nil {
-			return fmt.Errorf("failed to load ec shard %v: %v", shard, err)
+			return fmt.Errorf("failed to load ec shard %v: %w", shard, err)
 		}
 	}
 
@@ -195,6 +195,10 @@ func (l *DiskLocation) loadAllEcShards() (err error) {
 }
 
 func (l *DiskLocation) deleteEcVolumeById(vid needle.VolumeId) (e error) {
+	// Add write lock since we're modifying the ecVolumes map
+	l.ecVolumesLock.Lock()
+	defer l.ecVolumesLock.Unlock()
+
 	ecVolume, ok := l.ecVolumes[vid]
 	if !ok {
 		return

@@ -13,6 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/viper"
+	"google.golang.org/grpc/credentials/tls/certprovider"
+	"google.golang.org/grpc/credentials/tls/certprovider/pemfile"
+	"google.golang.org/grpc/reflection"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -21,10 +26,7 @@ import (
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"github.com/spf13/viper"
-	"google.golang.org/grpc/credentials/tls/certprovider"
-	"google.golang.org/grpc/credentials/tls/certprovider/pemfile"
-	"google.golang.org/grpc/reflection"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
 var (
@@ -35,6 +37,8 @@ var (
 	filerWebDavOptions WebDavOption
 	filerStartIam      *bool
 	filerIamOptions    IamOptions
+	filerStartSftp     *bool
+	filerSftpOptions   SftpOptions
 )
 
 type FilerOptions struct {
@@ -119,6 +123,10 @@ func init() {
 	filerS3Options.allowEmptyFolder = cmdFiler.Flag.Bool("s3.allowEmptyFolder", true, "allow empty folders")
 	filerS3Options.allowDeleteBucketNotEmpty = cmdFiler.Flag.Bool("s3.allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
 	filerS3Options.localSocket = cmdFiler.Flag.String("s3.localSocket", "", "default to /tmp/seaweedfs-s3-<port>.sock")
+	filerS3Options.tlsCACertificate = cmdFiler.Flag.String("s3.cacert.file", "", "path to the TLS CA certificate file")
+	filerS3Options.tlsVerifyClientCert = cmdFiler.Flag.Bool("s3.tlsVerifyClientCert", false, "whether to verify the client's certificate")
+	filerS3Options.bindIp = cmdFiler.Flag.String("s3.ip.bind", "", "ip address to bind to. If empty, default to same as -ip.bind option.")
+	filerS3Options.idleTimeout = cmdFiler.Flag.Int("s3.idleTimeout", 10, "connection idle seconds")
 
 	// start webdav on filer
 	filerStartWebDav = cmdFiler.Flag.Bool("webdav", false, "whether to start webdav gateway")
@@ -137,6 +145,19 @@ func init() {
 	filerStartIam = cmdFiler.Flag.Bool("iam", false, "whether to start IAM service")
 	filerIamOptions.ip = cmdFiler.Flag.String("iam.ip", *f.ip, "iam server http listen ip address")
 	filerIamOptions.port = cmdFiler.Flag.Int("iam.port", 8111, "iam server http listen port")
+
+	filerStartSftp = cmdFiler.Flag.Bool("sftp", false, "whether to start the SFTP server")
+	filerSftpOptions.port = cmdFiler.Flag.Int("sftp.port", 2022, "SFTP server listen port")
+	filerSftpOptions.sshPrivateKey = cmdFiler.Flag.String("sftp.sshPrivateKey", "", "path to the SSH private key file for host authentication")
+	filerSftpOptions.hostKeysFolder = cmdFiler.Flag.String("sftp.hostKeysFolder", "", "path to folder containing SSH private key files for host authentication")
+	filerSftpOptions.authMethods = cmdFiler.Flag.String("sftp.authMethods", "password,publickey", "comma-separated list of allowed auth methods: password, publickey, keyboard-interactive")
+	filerSftpOptions.maxAuthTries = cmdFiler.Flag.Int("sftp.maxAuthTries", 6, "maximum number of authentication attempts per connection")
+	filerSftpOptions.bannerMessage = cmdFiler.Flag.String("sftp.bannerMessage", "SeaweedFS SFTP Server - Unauthorized access is prohibited", "message displayed before authentication")
+	filerSftpOptions.loginGraceTime = cmdFiler.Flag.Duration("sftp.loginGraceTime", 2*time.Minute, "timeout for authentication")
+	filerSftpOptions.clientAliveInterval = cmdFiler.Flag.Duration("sftp.clientAliveInterval", 5*time.Second, "interval for sending keep-alive messages")
+	filerSftpOptions.clientAliveCountMax = cmdFiler.Flag.Int("sftp.clientAliveCountMax", 3, "maximum number of missed keep-alive messages before disconnecting")
+	filerSftpOptions.userStoreFile = cmdFiler.Flag.String("sftp.userStoreFile", "", "path to JSON file containing user credentials and permissions")
+	filerSftpOptions.localSocket = cmdFiler.Flag.String("sftp.localSocket", "", "default to /tmp/seaweedfs-sftp-<port>.sock")
 }
 
 func filerLongDesc() string {
@@ -195,7 +216,9 @@ func runFiler(cmd *Command, args []string) bool {
 	startDelay := time.Duration(2)
 	if *filerStartS3 {
 		filerS3Options.filer = &filerAddress
-		filerS3Options.bindIp = f.bindIp
+		if *filerS3Options.bindIp == "" {
+			filerS3Options.bindIp = f.bindIp
+		}
 		filerS3Options.localFilerSocket = f.localSocket
 		if *f.dataCenter != "" && *filerS3Options.dataCenter == "" {
 			filerS3Options.dataCenter = f.dataCenter
@@ -209,6 +232,7 @@ func runFiler(cmd *Command, args []string) bool {
 
 	if *filerStartWebDav {
 		filerWebDavOptions.filer = &filerAddress
+		filerWebDavOptions.ipBind = f.bindIp
 
 		if *filerWebDavOptions.disk == "" {
 			filerWebDavOptions.disk = f.diskType
@@ -227,6 +251,18 @@ func runFiler(cmd *Command, args []string) bool {
 		go func(delay time.Duration) {
 			time.Sleep(delay * time.Second)
 			filerIamOptions.startIamServer()
+		}(startDelay)
+		startDelay++
+	}
+
+	if *filerStartSftp {
+		sftpOptions.filer = &filerAddress
+		if *f.dataCenter != "" && *filerSftpOptions.dataCenter == "" {
+			filerSftpOptions.dataCenter = f.dataCenter
+		}
+		go func(delay time.Duration) {
+			time.Sleep(delay * time.Second)
+			sftpOptions.startSftpServer()
 		}(startDelay)
 	}
 
@@ -295,7 +331,7 @@ func (fo *FilerOptions) startFiler() {
 
 	if *fo.publicPort != 0 {
 		publicListeningAddress := util.JoinHostPort(*fo.bindIp, *fo.publicPort)
-		glog.V(0).Infoln("Start Seaweed filer server", util.Version(), "public at", publicListeningAddress)
+		glog.V(0).Infoln("Start Seaweed filer server", version.Version(), "public at", publicListeningAddress)
 		publicListener, localPublicListener, e := util.NewIpAndLocalListeners(*fo.bindIp, *fo.publicPort, 0)
 		if e != nil {
 			glog.Fatalf("Filer server public listener error on port %d:%v", *fo.publicPort, e)
@@ -314,7 +350,7 @@ func (fo *FilerOptions) startFiler() {
 		}
 	}
 
-	glog.V(0).Infof("Start Seaweed Filer %s at %s:%d", util.Version(), *fo.ip, *fo.port)
+	glog.V(0).Infof("Start Seaweed Filer %s at %s:%d", version.Version(), *fo.ip, *fo.port)
 	filerListener, filerLocalListener, e := util.NewIpAndLocalListeners(
 		*fo.bindIp, *fo.port,
 		time.Duration(10)*time.Second,
@@ -337,7 +373,6 @@ func (fo *FilerOptions) startFiler() {
 	}
 	go grpcS.Serve(grpcL)
 
-	httpS := &http.Server{Handler: defaultMux}
 	if runtime.GOOS != "windows" {
 		localSocket := *fo.localSocket
 		if localSocket == "" {
@@ -352,7 +387,7 @@ func (fo *FilerOptions) startFiler() {
 			if err != nil {
 				glog.Fatalf("Failed to listen on %s: %v", localSocket, err)
 			}
-			httpS.Serve(filerSocketListener)
+			newHttpServer(defaultMux, nil).Serve(filerSocketListener)
 		}()
 	}
 
@@ -385,31 +420,33 @@ func (fo *FilerOptions) startFiler() {
 			clientAuth = tls.RequireAndVerifyClientCert
 		}
 
-		httpS.TLSConfig = &tls.Config{
+		tlsConfig := &tls.Config{
 			GetCertificate: fo.GetCertificateWithUpdate,
 			ClientAuth:     clientAuth,
 			ClientCAs:      caCertPool,
 		}
 
+		security.FixTlsConfig(util.GetViper(), tlsConfig)
+
 		if filerLocalListener != nil {
 			go func() {
-				if err := httpS.ServeTLS(filerLocalListener, "", ""); err != nil {
+				if err := newHttpServer(defaultMux, tlsConfig).ServeTLS(filerLocalListener, "", ""); err != nil {
 					glog.Errorf("Filer Fail to serve: %v", e)
 				}
 			}()
 		}
-		if err := httpS.ServeTLS(filerListener, "", ""); err != nil {
+		if err := newHttpServer(defaultMux, tlsConfig).ServeTLS(filerListener, "", ""); err != nil {
 			glog.Fatalf("Filer Fail to serve: %v", e)
 		}
 	} else {
 		if filerLocalListener != nil {
 			go func() {
-				if err := httpS.Serve(filerLocalListener); err != nil {
+				if err := newHttpServer(defaultMux, nil).Serve(filerLocalListener); err != nil {
 					glog.Errorf("Filer Fail to serve: %v", e)
 				}
 			}()
 		}
-		if err := httpS.Serve(filerListener); err != nil {
+		if err := newHttpServer(defaultMux, nil).Serve(filerListener); err != nil {
 			glog.Fatalf("Filer Fail to serve: %v", e)
 		}
 	}

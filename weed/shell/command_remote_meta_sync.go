@@ -44,6 +44,10 @@ func (c *commandRemoteMetaSync) Help() string {
 `
 }
 
+func (c *commandRemoteMetaSync) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandRemoteMetaSync) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	remoteMetaSyncCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -62,7 +66,7 @@ func (c *commandRemoteMetaSync) Do(args []string, commandEnv *CommandEnv, writer
 
 	// pull metadata from remote
 	if err = pullMetadata(commandEnv, writer, util.FullPath(localMountedDir), remoteStorageMountedLocation, util.FullPath(*dir), remoteStorageConf); err != nil {
-		return fmt.Errorf("cache meta data: %v", err)
+		return fmt.Errorf("cache meta data: %w", err)
 	}
 
 	return nil
@@ -132,7 +136,7 @@ func pullMetadata(commandEnv *CommandEnv, writer io.Writer, localMountedDir util
 			localDir := filer.MapRemoteStorageLocationPathToFullPath(localMountedDir, remoteMountedLocation, remoteDir)
 			fmt.Fprint(writer, localDir.Child(name))
 
-			lookupResponse, lookupErr := filer_pb.LookupEntry(client, &filer_pb.LookupDirectoryEntryRequest{
+			lookupResponse, lookupErr := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
 				Directory: string(localDir),
 				Name:      name,
 			})

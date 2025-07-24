@@ -2,16 +2,19 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mq/sub_coordinator"
 	"github.com/seaweedfs/seaweedfs/weed/mq/topic"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util/log_buffer"
-	"io"
-	"time"
 )
 
 func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_SubscribeMessageServer) error {
@@ -38,7 +41,8 @@ func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_Subs
 		return getOrGenErr
 	}
 
-	localTopicPartition.Subscribers.AddSubscriber(clientName, topic.NewLocalSubscriber())
+	subscriber := topic.NewLocalSubscriber()
+	localTopicPartition.Subscribers.AddSubscriber(clientName, subscriber)
 	glog.V(0).Infof("Subscriber %s connected on %v %v", clientName, t, partition)
 	isConnected := true
 	sleepIntervalCount := 0
@@ -54,7 +58,7 @@ func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_Subs
 	}()
 
 	startPosition := b.getRequestPosition(req.GetInit())
-	imt := sub_coordinator.NewInflightMessageTracker(int(req.GetInit().Concurrency))
+	imt := sub_coordinator.NewInflightMessageTracker(int(req.GetInit().SlidingWindowSize))
 
 	// connect to the follower
 	var subscribeFollowMeStream mq_pb.SeaweedMessaging_SubscribeFollowMeClient
@@ -66,7 +70,9 @@ func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_Subs
 		} else {
 			defer func() {
 				println("closing SubscribeFollowMe connection", follower)
-				subscribeFollowMeStream.CloseSend()
+				if subscribeFollowMeStream != nil {
+					subscribeFollowMeStream.CloseSend()
+				}
 				// followerGrpcConnection.Close()
 			}()
 			followerClient := mq_pb.NewSeaweedMessagingClient(followerGrpcConnection)
@@ -111,7 +117,10 @@ func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_Subs
 				continue
 			}
 			imt.AcknowledgeMessage(ack.GetAck().Key, ack.GetAck().Sequence)
+
 			currentLastOffset := imt.GetOldestAckedTimestamp()
+			// Update acknowledged offset and last seen time for this subscriber when it sends an ack
+			subscriber.UpdateAckedOffset(currentLastOffset)
 			// fmt.Printf("%+v recv (%s,%d), oldest %d\n", partition, string(ack.GetAck().Key), ack.GetAck().Sequence, currentLastOffset)
 			if subscribeFollowMeStream != nil && currentLastOffset > lastOffset {
 				if err := subscribeFollowMeStream.Send(&mq_pb.SubscribeFollowMeRequest{
@@ -140,7 +149,9 @@ func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_Subs
 					Close: &mq_pb.SubscribeFollowMeRequest_CloseMessage{},
 				},
 			}); err != nil {
-				glog.Errorf("Error sending close to follower: %v", err)
+				if err != io.EOF {
+					glog.Errorf("Error sending close to follower: %v", err)
+				}
 			}
 		}
 	}()
@@ -159,7 +170,7 @@ func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_Subs
 		select {
 		case <-ctx.Done():
 			err := ctx.Err()
-			if err == context.Canceled {
+			if errors.Is(err, context.Canceled) {
 				// Client disconnected
 				return false
 			}
@@ -176,6 +187,19 @@ func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_Subs
 
 		for imt.IsInflight(logEntry.Key) {
 			time.Sleep(137 * time.Millisecond)
+			// Check if the client has disconnected by monitoring the context
+			select {
+			case <-ctx.Done():
+				err := ctx.Err()
+				if err == context.Canceled {
+					// Client disconnected
+					return false, nil
+				}
+				glog.V(0).Infof("Subscriber %s disconnected: %v", clientName, err)
+				return false, nil
+			default:
+				// Continue processing the request
+			}
 		}
 		if logEntry.Key != nil {
 			imt.EnflightMessage(logEntry.Key, logEntry.TsNs)
@@ -192,6 +216,9 @@ func (b *MessageQueueBroker) SubscribeMessage(stream mq_pb.SeaweedMessaging_Subs
 			return false, err
 		}
 
+		// Update received offset and last seen time for this subscriber
+		subscriber.UpdateReceivedOffset(logEntry.TsNs)
+
 		counter++
 		return false, nil
 	})
@@ -202,20 +229,35 @@ func (b *MessageQueueBroker) getRequestPosition(initMessage *mq_pb.SubscribeMess
 		return
 	}
 	offset := initMessage.GetPartitionOffset()
-	if offset.StartTsNs != 0 {
+	offsetType := initMessage.OffsetType
+
+	// reset to earliest or latest
+	if offsetType == schema_pb.OffsetType_RESET_TO_EARLIEST {
+		startPosition = log_buffer.NewMessagePosition(1, -3)
+		return
+	}
+	if offsetType == schema_pb.OffsetType_RESET_TO_LATEST {
+		startPosition = log_buffer.NewMessagePosition(time.Now().UnixNano(), -4)
+		return
+	}
+
+	// use the exact timestamp
+	if offsetType == schema_pb.OffsetType_EXACT_TS_NS {
 		startPosition = log_buffer.NewMessagePosition(offset.StartTsNs, -2)
 		return
 	}
+
+	// try to resume
 	if storedOffset, err := b.readConsumerGroupOffset(initMessage); err == nil {
 		glog.V(0).Infof("resume from saved offset %v %v %v: %v", initMessage.Topic, initMessage.PartitionOffset.Partition, initMessage.ConsumerGroup, storedOffset)
 		startPosition = log_buffer.NewMessagePosition(storedOffset, -2)
 		return
 	}
 
-	if offset.StartType == mq_pb.PartitionOffsetStartType_EARLIEST {
-		startPosition = log_buffer.NewMessagePosition(1, -3)
-	} else if offset.StartType == mq_pb.PartitionOffsetStartType_LATEST {
-		startPosition = log_buffer.NewMessagePosition(time.Now().UnixNano(), -4)
+	if offsetType == schema_pb.OffsetType_RESUME_OR_EARLIEST {
+		startPosition = log_buffer.NewMessagePosition(1, -5)
+	} else if offsetType == schema_pb.OffsetType_RESUME_OR_LATEST {
+		startPosition = log_buffer.NewMessagePosition(time.Now().UnixNano(), -6)
 	}
 	return
 }

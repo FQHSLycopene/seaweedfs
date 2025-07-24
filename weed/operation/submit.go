@@ -19,19 +19,15 @@ import (
 )
 
 type FilePart struct {
-	Reader      io.Reader
-	FileName    string
-	FileSize    int64
-	MimeType    string
-	ModTime     int64 //in seconds
-	Replication string
-	Collection  string
-	DataCenter  string
-	Ttl         string
-	DiskType    string
-	Server      string //this comes from assign result
-	Fid         string //this comes from assign result, but customizable
-	Fsync       bool
+	Reader   io.Reader
+	FileName string
+	FileSize int64
+	MimeType string
+	ModTime  int64 //in seconds
+	Pref     StoragePreference
+	Server   string //this comes from assign result
+	Fid      string //this comes from assign result, but customizable
+	Fsync    bool
 }
 
 type SubmitResult struct {
@@ -42,22 +38,31 @@ type SubmitResult struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type StoragePreference struct {
+	Replication string
+	Collection  string
+	DataCenter  string
+	Ttl         string
+	DiskType    string
+	MaxMB       int
+}
+
 type GetMasterFn func(ctx context.Context) pb.ServerAddress
 
-func SubmitFiles(masterFn GetMasterFn, grpcDialOption grpc.DialOption, files []FilePart, replication string, collection string, dataCenter string, ttl string, diskType string, maxMB int, usePublicUrl bool) ([]SubmitResult, error) {
+func SubmitFiles(masterFn GetMasterFn, grpcDialOption grpc.DialOption, files []*FilePart, pref StoragePreference, usePublicUrl bool) ([]SubmitResult, error) {
 	results := make([]SubmitResult, len(files))
 	for index, file := range files {
 		results[index].FileName = file.FileName
 	}
 	ar := &VolumeAssignRequest{
 		Count:       uint64(len(files)),
-		Replication: replication,
-		Collection:  collection,
-		DataCenter:  dataCenter,
-		Ttl:         ttl,
-		DiskType:    diskType,
+		Replication: pref.Replication,
+		Collection:  pref.Collection,
+		DataCenter:  pref.DataCenter,
+		Ttl:         pref.Ttl,
+		DiskType:    pref.DiskType,
 	}
-	ret, err := Assign(masterFn, grpcDialOption, ar)
+	ret, err := Assign(context.Background(), masterFn, grpcDialOption, ar)
 	if err != nil {
 		for index := range files {
 			results[index].Error = err.Error()
@@ -73,12 +78,8 @@ func SubmitFiles(masterFn GetMasterFn, grpcDialOption grpc.DialOption, files []F
 		if usePublicUrl {
 			file.Server = ret.PublicUrl
 		}
-		file.Replication = replication
-		file.Collection = collection
-		file.DataCenter = dataCenter
-		file.Ttl = ttl
-		file.DiskType = diskType
-		results[index].Size, err = file.Upload(maxMB, masterFn, usePublicUrl, ret.Auth, grpcDialOption)
+		file.Pref = pref
+		results[index].Size, err = file.Upload(pref.MaxMB, masterFn, usePublicUrl, ret.Auth, grpcDialOption)
 		if err != nil {
 			results[index].Error = err.Error()
 		}
@@ -88,8 +89,8 @@ func SubmitFiles(masterFn GetMasterFn, grpcDialOption grpc.DialOption, files []F
 	return results, nil
 }
 
-func NewFileParts(fullPathFilenames []string) (ret []FilePart, err error) {
-	ret = make([]FilePart, len(fullPathFilenames))
+func NewFileParts(fullPathFilenames []string) (ret []*FilePart, err error) {
+	ret = make([]*FilePart, len(fullPathFilenames))
 	for index, file := range fullPathFilenames {
 		if ret[index], err = newFilePart(file); err != nil {
 			return
@@ -97,7 +98,8 @@ func NewFileParts(fullPathFilenames []string) (ret []FilePart, err error) {
 	}
 	return
 }
-func newFilePart(fullPathFilename string) (ret FilePart, err error) {
+func newFilePart(fullPathFilename string) (ret *FilePart, err error) {
+	ret = &FilePart{}
 	fh, openErr := os.Open(fullPathFilename)
 	if openErr != nil {
 		glog.V(0).Info("Failed to open file: ", fullPathFilename)
@@ -121,7 +123,7 @@ func newFilePart(fullPathFilename string) (ret FilePart, err error) {
 	return ret, nil
 }
 
-func (fi FilePart) Upload(maxMB int, masterFn GetMasterFn, usePublicUrl bool, jwt security.EncodedJwt, grpcDialOption grpc.DialOption) (retSize uint32, err error) {
+func (fi *FilePart) Upload(maxMB int, masterFn GetMasterFn, usePublicUrl bool, jwt security.EncodedJwt, grpcDialOption grpc.DialOption) (retSize uint32, err error) {
 	fileUrl := "http://" + fi.Server + "/" + fi.Fid
 	if fi.ModTime != 0 {
 		fileUrl += "?ts=" + strconv.Itoa(int(fi.ModTime))
@@ -145,29 +147,29 @@ func (fi FilePart) Upload(maxMB int, masterFn GetMasterFn, usePublicUrl bool, jw
 
 		var ret *AssignResult
 		var id string
-		if fi.DataCenter != "" {
+		if fi.Pref.DataCenter != "" {
 			ar := &VolumeAssignRequest{
 				Count:       uint64(chunks),
-				Replication: fi.Replication,
-				Collection:  fi.Collection,
-				Ttl:         fi.Ttl,
-				DiskType:    fi.DiskType,
+				Replication: fi.Pref.Replication,
+				Collection:  fi.Pref.Collection,
+				Ttl:         fi.Pref.Ttl,
+				DiskType:    fi.Pref.DiskType,
 			}
-			ret, err = Assign(masterFn, grpcDialOption, ar)
+			ret, err = Assign(context.Background(), masterFn, grpcDialOption, ar)
 			if err != nil {
 				return
 			}
 		}
 		for i := int64(0); i < chunks; i++ {
-			if fi.DataCenter == "" {
+			if fi.Pref.DataCenter == "" {
 				ar := &VolumeAssignRequest{
 					Count:       1,
-					Replication: fi.Replication,
-					Collection:  fi.Collection,
-					Ttl:         fi.Ttl,
-					DiskType:    fi.DiskType,
+					Replication: fi.Pref.Replication,
+					Collection:  fi.Pref.Collection,
+					Ttl:         fi.Pref.Ttl,
+					DiskType:    fi.Pref.DiskType,
 				}
-				ret, err = Assign(masterFn, grpcDialOption, ar)
+				ret, err = Assign(context.Background(), masterFn, grpcDialOption, ar)
 				if err != nil {
 					// delete all uploaded chunks
 					cm.DeleteChunks(masterFn, usePublicUrl, grpcDialOption)
@@ -221,7 +223,7 @@ func (fi FilePart) Upload(maxMB int, masterFn GetMasterFn, usePublicUrl bool, jw
 			return 0, e
 		}
 
-		ret, e, _ := uploader.Upload(fi.Reader, uploadOption)
+		ret, e, _ := uploader.Upload(context.Background(), fi.Reader, uploadOption)
 		if e != nil {
 			return 0, e
 		}
@@ -265,7 +267,7 @@ func uploadOneChunk(filename string, reader io.Reader, masterFn GetMasterFn,
 		return 0, uploaderError
 	}
 
-	uploadResult, uploadError, _ := uploader.Upload(reader, uploadOption)
+	uploadResult, uploadError, _ := uploader.Upload(context.Background(), reader, uploadOption)
 	if uploadError != nil {
 		return 0, uploadError
 	}
@@ -297,6 +299,6 @@ func uploadChunkedFileManifest(fileUrl string, manifest *ChunkManifest, jwt secu
 		return e
 	}
 
-	_, e = uploader.UploadData(buf, uploadOption)
+	_, e = uploader.UploadData(context.Background(), buf, uploadOption)
 	return e
 }

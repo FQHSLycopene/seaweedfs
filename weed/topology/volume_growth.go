@@ -3,11 +3,13 @@ package topology
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"math/rand/v2"
 	"reflect"
 	"sync"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/server/constants"
 
 	"google.golang.org/grpc"
 
@@ -65,6 +67,7 @@ type VolumeGrowOption struct {
 	Rack               string                        `json:"rack,omitempty"`
 	DataNode           string                        `json:"dataNode,omitempty"`
 	MemoryMapMaxSizeMb uint32                        `json:"memoryMapMaxSizeMb,omitempty"`
+	Version            uint32                        `json:"version,omitempty"`
 }
 
 type VolumeGrowth struct {
@@ -125,6 +128,10 @@ func (vg *VolumeGrowth) findAndGrow(grpcDialOption grpc.DialOption, topo *Topolo
 	servers, e := vg.findEmptySlotsForOneVolume(topo, option)
 	if e != nil {
 		return nil, e
+	}
+	for !topo.LastLeaderChangeTime.Add(constants.VolumePulseSeconds * 2).Before(time.Now()) {
+		glog.V(0).Infof("wait for volume servers to join back")
+		time.Sleep(constants.VolumePulseSeconds / 2)
 	}
 	vid, raftErr := topo.NextVolumeId()
 	if raftErr != nil {
@@ -257,7 +264,7 @@ func (vg *VolumeGrowth) grow(grpcDialOption grpc.DialOption, topo *Topology, vid
 				Collection:       option.Collection,
 				ReplicaPlacement: option.ReplicaPlacement,
 				Ttl:              option.Ttl,
-				Version:          needle.CurrentVersion,
+				Version:          needle.Version(option.Version),
 				DiskType:         option.DiskType.String(),
 				ModifiedAtSecond: time.Now().Unix(),
 			})

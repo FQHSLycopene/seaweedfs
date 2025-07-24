@@ -29,7 +29,7 @@ func LookupFn(filerClient filer_pb.FilerClient) wdclient.LookupFileIdFunctionTyp
 
 	vidCache := make(map[string]*filer_pb.Locations)
 	var vicCacheLock sync.RWMutex
-	return func(fileId string) (targetUrls []string, err error) {
+	return func(ctx context.Context, fileId string) (targetUrls []string, err error) {
 		vid := VolumeId(fileId)
 		vicCacheLock.RLock()
 		locations, found := vidCache[vid]
@@ -38,7 +38,7 @@ func LookupFn(filerClient filer_pb.FilerClient) wdclient.LookupFileIdFunctionTyp
 		if !found {
 			util.Retry("lookup volume "+vid, func() error {
 				err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-					resp, err := client.LookupVolume(context.Background(), &filer_pb.LookupVolumeRequest{
+					resp, err := client.LookupVolume(ctx, &filer_pb.LookupVolumeRequest{
 						VolumeIds: []string{vid},
 					})
 					if err != nil {
@@ -47,7 +47,7 @@ func LookupFn(filerClient filer_pb.FilerClient) wdclient.LookupFileIdFunctionTyp
 
 					locations = resp.LocationsMap[vid]
 					if locations == nil || len(locations.Locations) == 0 {
-						glog.V(0).Infof("failed to locate %s", fileId)
+						glog.V(0).InfofCtx(ctx, "failed to locate %s", fileId)
 						return fmt.Errorf("failed to locate %s", fileId)
 					}
 					vicCacheLock.Lock()
@@ -95,6 +95,10 @@ func NewChunkReaderAtFromClient(readerCache *ReaderCache, chunkViews *IntervalLi
 		readerCache:   readerCache,
 		readerPattern: NewReaderPattern(),
 	}
+}
+
+func (c *ChunkReadAt) Size() int64 {
+	return c.fileSize
 }
 
 func (c *ChunkReadAt) Close() error {
@@ -169,15 +173,14 @@ func (c *ChunkReadAt) doReadAt(p []byte, offset int64) (n int, ts int64, err err
 	// zero the remaining bytes if a gap exists at the end of the last chunk (or a fully sparse file)
 	if err == nil && remaining > 0 {
 		var delta int64
-		if c.fileSize > startOffset {
+		if c.fileSize >= startOffset {
 			delta = min(remaining, c.fileSize-startOffset)
 			startOffset -= offset
-		} else {
-			delta = remaining
-			startOffset = max(startOffset-offset, startOffset-remaining-offset)
 		}
-		glog.V(4).Infof("zero2 [%d,%d) of file size %d bytes", startOffset, startOffset+delta, c.fileSize)
-		n += zero(p, startOffset, delta)
+		if delta > 0 {
+			glog.V(4).Infof("zero2 [%d,%d) of file size %d bytes", startOffset, startOffset+delta, c.fileSize)
+			n += zero(p, startOffset, delta)
+		}
 	}
 
 	if err == nil && offset+int64(len(p)) >= c.fileSize {
@@ -216,6 +219,9 @@ func (c *ChunkReadAt) readChunkSliceAt(buffer []byte, chunkView *ChunkView, next
 }
 
 func zero(buffer []byte, start, length int64) int {
+	if length <= 0 {
+		return 0
+	}
 	end := min(start+length, int64(len(buffer)))
 	start = max(start, 0)
 

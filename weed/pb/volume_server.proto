@@ -180,6 +180,7 @@ message AllocateVolumeRequest {
     string ttl = 5;
     uint32 memory_map_max_size_mb = 6;
     string disk_type = 7;
+    uint32 version = 8;
 }
 message AllocateVolumeResponse {
 }
@@ -195,6 +196,7 @@ message VolumeSyncStatusResponse {
     uint64 tail_offset = 6;
     uint32 compact_revision = 7;
     uint64 idx_file_size = 8;
+    uint32 version = 9;
 }
 
 message VolumeIncrementalCopyRequest {
@@ -226,6 +228,7 @@ message VolumeDeleteResponse {
 
 message VolumeMarkReadonlyRequest {
     uint32 volume_id = 1;
+    bool persist = 2;
 }
 message VolumeMarkReadonlyResponse {
 }
@@ -338,6 +341,7 @@ message VolumeTailSenderResponse {
     bytes needle_header = 1;
     bytes needle_body = 2;
     bool is_last_chunk = 3;
+    uint32 version = 4;
 }
 
 message VolumeTailReceiverRequest {
@@ -441,6 +445,7 @@ message ReadVolumeFileStatusResponse {
     string collection = 8;
     string disk_type = 9;
     VolumeInfo volume_info = 10;
+    uint32 version = 11;
 }
 
 message DiskStatus {
@@ -477,9 +482,18 @@ message VolumeInfo {
     repeated RemoteFile files = 1;
     uint32 version = 2;
     string replication = 3;
+    uint32 bytes_offset = 4;
+    int64 dat_file_size = 5; // store the original dat file size
+    uint64 expire_at_sec = 6; // expiration time of ec volume
+    bool read_only = 7;
+}
+message OldVersionVolumeInfo {
+    repeated RemoteFile files = 1;
+    uint32 version = 2;
+    string replication = 3;
     uint32 BytesOffset = 4;
-    int64 dat_file_size = 5; // used for EC encoded volumes to store the original file size
-    uint64 DestroyTime = 6; // used to record the destruction time of ec volume
+    int64 dat_file_size = 5; // store the original dat file size
+    uint64 DestroyTime = 6; // expiration time of ec volume
     bool read_only = 7;
 }
 

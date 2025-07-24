@@ -3,14 +3,13 @@ package erasure_coding
 import (
 	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"math"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
-
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
@@ -42,7 +41,7 @@ type EcVolume struct {
 	ecjFileAccessLock         sync.Mutex
 	diskType                  types.DiskType
 	datFileSize               int64
-	DestroyTime               uint64 //ec volume destroy time, calculated from the ec volume was created
+	ExpireAtSec               uint64 //ec volume destroy time, calculated from the ec volume was created
 }
 
 func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection string, vid needle.VolumeId) (ev *EcVolume, err error) {
@@ -73,7 +72,7 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 	if volumeInfo, _, found, _ := volume_info.MaybeLoadVolumeInfo(dataBaseFileName + ".vif"); found {
 		ev.Version = needle.Version(volumeInfo.Version)
 		ev.datFileSize = volumeInfo.DatFileSize
-		ev.DestroyTime = volumeInfo.DestroyTime
+		ev.ExpireAtSec = volumeInfo.ExpireAtSec
 	} else {
 		glog.Warningf("vif file not found,volumeId:%d, filename:%s", vid, dataBaseFileName)
 		volume_info.SaveVolumeInfo(dataBaseFileName+".vif", &volume_server_pb.VolumeInfo{Version: uint32(ev.Version)})
@@ -112,7 +111,7 @@ func (ev *EcVolume) DeleteEcVolumeShard(shardId ShardId) (ecVolumeShard *EcVolum
 	}
 
 	ecVolumeShard = ev.Shards[foundPosition]
-
+	ecVolumeShard.Unmount()
 	ev.Shards = append(ev.Shards[:foundPosition], ev.Shards[foundPosition+1:]...)
 	return ecVolumeShard, true
 }
@@ -206,7 +205,7 @@ func (ev *EcVolume) ToVolumeEcShardInformationMessage() (messages []*master_pb.V
 				Id:          uint32(s.VolumeId),
 				Collection:  s.Collection,
 				DiskType:    string(ev.diskType),
-				DestroyTime: ev.DestroyTime,
+				ExpireAtSec: ev.ExpireAtSec,
 			}
 			messages = append(messages, m)
 		}
@@ -221,7 +220,7 @@ func (ev *EcVolume) LocateEcShardNeedle(needleId types.NeedleId, version needle.
 	// find the needle from ecx file
 	offset, size, err = ev.FindNeedleFromEcx(needleId)
 	if err != nil {
-		return types.Offset{}, 0, nil, fmt.Errorf("FindNeedleFromEcx: %v", err)
+		return types.Offset{}, 0, nil, fmt.Errorf("FindNeedleFromEcx: %w", err)
 	}
 
 	intervals = ev.LocateEcShardNeedleInterval(version, offset.ToActualOffset(), types.Size(needle.GetActualSize(size, version)))
@@ -255,13 +254,15 @@ func SearchNeedleFromSortedIndex(ecxFile *os.File, ecxFileSize int64, needleId t
 	l, h := int64(0), ecxFileSize/types.NeedleMapEntrySize
 	for l < h {
 		m := (l + h) / 2
-		if _, err := ecxFile.ReadAt(buf, m*types.NeedleMapEntrySize); err != nil {
-			return types.Offset{}, types.TombstoneFileSize, fmt.Errorf("ecx file %d read at %d: %v", ecxFileSize, m*types.NeedleMapEntrySize, err)
+		if n, err := ecxFile.ReadAt(buf, m*types.NeedleMapEntrySize); err != nil {
+			if n != types.NeedleMapEntrySize {
+				return types.Offset{}, types.TombstoneFileSize, fmt.Errorf("ecx file %d read at %d: %v", ecxFileSize, m*types.NeedleMapEntrySize, err)
+			}
 		}
 		key, offset, size = idx.IdxFileEntry(buf)
 		if key == needleId {
 			if processNeedleFn != nil {
-				err = processNeedleFn(ecxFile, m*types.NeedleHeaderSize)
+				err = processNeedleFn(ecxFile, m*types.NeedleMapEntrySize)
 			}
 			return
 		}
@@ -277,5 +278,5 @@ func SearchNeedleFromSortedIndex(ecxFile *os.File, ecxFileSize int64, needleId t
 }
 
 func (ev *EcVolume) IsTimeToDestroy() bool {
-	return ev.DestroyTime > 0 && time.Now().Unix() > (int64(ev.DestroyTime)+destroyDelaySeconds)
+	return ev.ExpireAtSec > 0 && time.Now().Unix() > (int64(ev.ExpireAtSec)+destroyDelaySeconds)
 }

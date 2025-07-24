@@ -1,5 +1,5 @@
-//go:build linux || darwin
-// +build linux darwin
+//go:build linux || darwin || freebsd
+// +build linux darwin freebsd
 
 package command
 
@@ -13,7 +13,10 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -61,7 +64,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	// basic checks
 	chunkSizeLimitMB := *mountOptions.chunkSizeLimitMB
 	if chunkSizeLimitMB <= 0 {
-		fmt.Printf("Please specify a reasonable buffer size.")
+		fmt.Printf("Please specify a reasonable buffer size.\n")
 		return false
 	}
 
@@ -75,7 +78,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		err = pb.WithOneOfGrpcFilerClients(false, filerAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
 			if err != nil {
-				return fmt.Errorf("get filer grpc address %v configuration: %v", filerAddresses, err)
+				return fmt.Errorf("get filer grpc address %v configuration: %w", filerAddresses, err)
 			}
 			cipher = resp.Cipher
 			return nil
@@ -236,6 +239,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		CacheDirForRead:    *option.cacheDirForRead,
 		CacheSizeMBForRead: *option.cacheSizeMBForRead,
 		CacheDirForWrite:   cacheDirForWrite,
+		CacheMetaTTlSec:    *option.cacheMetaTtlSec,
 		DataCenter:         *option.dataCenter,
 		Quota:              int64(*option.collectionQuota) * 1024 * 1024,
 		MountUid:           uid,
@@ -248,12 +252,13 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		Cipher:             cipher,
 		UidGidMapper:       uidGidMapper,
 		DisableXAttr:       *option.disableXAttr,
+		IsMacOs:            runtime.GOOS == "darwin",
 	})
 
 	// create mount root
 	mountRootPath := util.FullPath(mountRoot)
 	mountRootParent, mountDir := mountRootPath.DirAndName()
-	if err = filer_pb.Mkdir(seaweedFileSystem, mountRootParent, mountDir, nil); err != nil {
+	if err = filer_pb.Mkdir(context.Background(), seaweedFileSystem, mountRootParent, mountDir, nil); err != nil {
 		fmt.Printf("failed to create dir %s on filer %s: %v\n", mountRoot, filerAddresses, err)
 		return false
 	}
@@ -265,6 +270,15 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	grace.OnInterrupt(func() {
 		unmount.Unmount(dir)
 	})
+
+	if mountOptions.fuseCommandPid != 0 {
+		// send a signal to the parent process to notify that the mount is ready
+		err = syscall.Kill(mountOptions.fuseCommandPid, syscall.SIGTERM)
+		if err != nil {
+			fmt.Printf("failed to notify parent process: %v\n", err)
+			return false
+		}
+	}
 
 	grpcS := pb.NewGrpcServer()
 	mount_pb.RegisterSeaweedMountServer(grpcS, seaweedFileSystem)
@@ -278,9 +292,11 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 	}
 
 	glog.V(0).Infof("mounted %s%s to %v", *option.filer, mountRoot, dir)
-	glog.V(0).Infof("This is SeaweedFS version %s %s %s", util.Version(), runtime.GOOS, runtime.GOARCH)
+	glog.V(0).Infof("This is SeaweedFS version %s %s %s", version.Version(), runtime.GOOS, runtime.GOARCH)
 
 	server.Serve()
+
+	seaweedFileSystem.ClearCacheDir()
 
 	return true
 }

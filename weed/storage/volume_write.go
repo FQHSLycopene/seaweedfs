@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"syscall"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"os"
 )
 
 var ErrorNotFound = errors.New("not found")
@@ -22,7 +24,7 @@ func (v *Volume) checkReadWriteError(err error) {
 		}
 		return
 	}
-	if err.Error() == "input/output error" {
+	if errors.Is(err, syscall.EIO) {
 		v.lastIoError = err
 	}
 }
@@ -147,7 +149,7 @@ func (v *Volume) doWriteRequest(n *needle.Needle, checkCookie bool) (offset uint
 	if ok {
 		existingNeedle, _, _, existingNeedleReadErr := needle.ReadNeedleHeader(v.DataBackend, v.Version(), nv.Offset.ToActualOffset())
 		if existingNeedleReadErr != nil {
-			err = fmt.Errorf("reading existing needle: %v", existingNeedleReadErr)
+			err = fmt.Errorf("reading existing needle: %w", existingNeedleReadErr)
 			return
 		}
 		if n.Cookie == 0 && !checkCookie {
@@ -165,9 +167,11 @@ func (v *Volume) doWriteRequest(n *needle.Needle, checkCookie bool) (offset uint
 
 	// append to dat file
 	n.UpdateAppendAtNs(v.lastAppendAtNs)
-	offset, size, _, err = n.Append(v.DataBackend, v.Version())
+	var actualSize int64
+	offset, size, actualSize, err = n.Append(v.DataBackend, v.Version())
 	v.checkReadWriteError(err)
 	if err != nil {
+		err = fmt.Errorf("append to volume %d size %d actualSize %d: %v", v.Id, size, actualSize, err)
 		return
 	}
 	v.lastAppendAtNs = n.AppendAtNs
@@ -323,6 +327,19 @@ func (v *Volume) WriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size
 		return fmt.Errorf("volume size limit %d exceeded! current size is %d", MaxPossibleVolumeSize, v.nm.ContentSize())
 	}
 
+	nv, ok := v.nm.Get(needleId)
+	if ok && nv.Size == size {
+		oldNeedle := new(needle.Needle)
+		err := oldNeedle.ReadData(v.DataBackend, nv.Offset.ToActualOffset(), nv.Size, v.Version())
+		if err == nil {
+			newNeedle := new(needle.Needle)
+			err = newNeedle.ReadBytes(needleBlob, nv.Offset.ToActualOffset(), size, v.Version())
+			if err == nil && oldNeedle.Cookie == newNeedle.Cookie && oldNeedle.Checksum == newNeedle.Checksum && bytes.Equal(oldNeedle.Data, newNeedle.Data) {
+				glog.V(0).Infof("needle %v already exists", needleId)
+				return nil
+			}
+		}
+	}
 	appendAtNs := needle.GetAppendAtNs(v.lastAppendAtNs)
 	offset, err := needle.WriteNeedleBlob(v.DataBackend, needleBlob, size, appendAtNs, v.Version())
 

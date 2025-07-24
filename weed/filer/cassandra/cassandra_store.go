@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gocql/gocql"
 	"time"
+
+	"github.com/gocql/gocql"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -202,15 +203,15 @@ func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath u
 		lastFileName = name
 		if decodeErr := entry.DecodeAttributesAndChunks(util.MaybeDecompressData(data)); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
 		if !eachEntryFunc(entry) {
 			break
 		}
 	}
-	if err := iter.Close(); err != nil {
-		glog.V(0).Infof("list iterator close: %v", err)
+	if err = iter.Close(); err != nil {
+		glog.V(0).InfofCtx(ctx, "list iterator close: %v", err)
 	}
 
 	return lastFileName, err

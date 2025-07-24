@@ -164,6 +164,9 @@ func (fsw *FilerStoreWrapper) FindEntry(ctx context.Context, fp util.FullPath) (
 	entry, err = actualStore.FindEntry(ctx, fp)
 	// glog.V(4).Infof("FindEntry %s: %v", fp, err)
 	if err != nil {
+		if fsw.CanDropWholeBucket() && strings.Contains(err.Error(), "Table") && strings.Contains(err.Error(), "doesn't exist") {
+			err = filer_pb.ErrNotFound
+		}
 		return nil, err
 	}
 
@@ -189,7 +192,7 @@ func (fsw *FilerStoreWrapper) DeleteEntry(ctx context.Context, fp util.FullPath)
 		// remove hard link
 		op := ctx.Value("OP")
 		if op != "MV" {
-			glog.V(4).Infof("DeleteHardLink %s", existingEntry.FullPath)
+			glog.V(4).InfofCtx(ctx, "DeleteHardLink %s", existingEntry.FullPath)
 			if err = fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); err != nil {
 				return err
 			}
@@ -212,7 +215,7 @@ func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry 
 		// remove hard link
 		op := ctx.Value("OP")
 		if op != "MV" {
-			glog.V(4).Infof("DeleteHardLink %s", existingEntry.FullPath)
+			glog.V(4).InfofCtx(ctx, "DeleteHardLink %s", existingEntry.FullPath)
 			if err = fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); err != nil {
 				return err
 			}

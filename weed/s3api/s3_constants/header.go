@@ -17,9 +17,10 @@
 package s3_constants
 
 import (
-	"github.com/gorilla/mux"
 	"net/http"
 	"strings"
+
+	"github.com/gorilla/mux"
 )
 
 // Standard S3 HTTP request constants
@@ -50,6 +51,18 @@ const (
 	AmzAclReadAcp     = "X-Amz-Grant-Read-Acp"
 	AmzAclWriteAcp    = "X-Amz-Grant-Write-Acp"
 
+	// S3 Object Lock headers
+	AmzBucketObjectLockEnabled   = "X-Amz-Bucket-Object-Lock-Enabled"
+	AmzObjectLockMode            = "X-Amz-Object-Lock-Mode"
+	AmzObjectLockRetainUntilDate = "X-Amz-Object-Lock-Retain-Until-Date"
+	AmzObjectLockLegalHold       = "X-Amz-Object-Lock-Legal-Hold"
+
+	// S3 conditional copy headers
+	AmzCopySourceIfMatch           = "X-Amz-Copy-Source-If-Match"
+	AmzCopySourceIfNoneMatch       = "X-Amz-Copy-Source-If-None-Match"
+	AmzCopySourceIfModifiedSince   = "X-Amz-Copy-Source-If-Modified-Since"
+	AmzCopySourceIfUnmodifiedSince = "X-Amz-Copy-Source-If-Unmodified-Since"
+
 	AmzMpPartsCount = "X-Amz-Mp-Parts-Count"
 )
 
@@ -58,7 +71,6 @@ const (
 	AmzIdentityId = "s3-identity-id"
 	AmzAccountId  = "s3-account-id"
 	AmzAuthType   = "s3-auth-type"
-	AmzIsAdmin    = "s3-is-admin" // only set to http request header as a context
 )
 
 func GetBucketAndObject(r *http.Request) (bucket, object string) {
@@ -70,6 +82,16 @@ func GetBucketAndObject(r *http.Request) (bucket, object string) {
 	}
 
 	return
+}
+
+func GetPrefix(r *http.Request) string {
+	query := r.URL.Query()
+	prefix := query.Get("prefix")
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+
+	return prefix
 }
 
 var PassThroughHeaders = map[string]string{

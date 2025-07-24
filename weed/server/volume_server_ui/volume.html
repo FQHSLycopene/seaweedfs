@@ -114,6 +114,7 @@
                 <th>Trash</th>
                 <th>TTL</th>
                 <th>ReadOnly</th>
+                <th>Version</th>
             </tr>
             </thead>
             <tbody>
@@ -127,6 +128,7 @@
                 <td>{{ .DeleteCount }} / {{bytesToHumanReadable .DeletedByteCount}}</td>
                 <td>{{ .Ttl }}</td>
                 <td>{{ .ReadOnly }}</td>
+                <td>{{ .Version }}</td>
             </tr>
             {{ end }}
             </tbody>
@@ -185,7 +187,7 @@
                 <td>{{ .Collection }}</td>
                 <td>{{ bytesToHumanReadable .ShardSize }}</td>
                 <td>{{ .ShardIdList }}</td>
-                <td>{{ .CreatedAt.Format "02 Jan 06 15:04 -0700" }}</td>
+                <td>{{ .CreatedAt.Format "2006-01-02 15:04" }}</td>
             </tr>
             {{ end }}
             </tbody>

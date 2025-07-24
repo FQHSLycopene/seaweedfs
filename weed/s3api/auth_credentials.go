@@ -1,19 +1,22 @@
 package s3api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 
+	"github.com/seaweedfs/seaweedfs/weed/credential"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"google.golang.org/grpc"
 )
 
 type Action string
@@ -35,6 +38,9 @@ type IdentityAccessManagement struct {
 	hashMu            sync.RWMutex
 	domain            string
 	isAuthEnabled     bool
+	credentialManager *credential.CredentialManager
+	filerClient       filer_pb.SeaweedFilerClient
+	grpcDialOption    grpc.DialOption
 }
 
 type Identity struct {
@@ -79,22 +85,6 @@ type Credential struct {
 	SecretKey string
 }
 
-func (i *Identity) isAnonymous() bool {
-	return i.Account.Id == s3_constants.AccountAnonymousId
-}
-
-func (action Action) isAdmin() bool {
-	return strings.HasPrefix(string(action), s3_constants.ACTION_ADMIN)
-}
-
-func (action Action) isOwner(bucket string) bool {
-	return string(action) == s3_constants.ACTION_ADMIN+":"+bucket
-}
-
-func (action Action) overBucket(bucket string) bool {
-	return strings.HasSuffix(string(action), ":"+bucket) || strings.HasSuffix(string(action), ":*")
-}
-
 // "Permission": "FULL_CONTROL"|"WRITE"|"WRITE_ACP"|"READ"|"READ_ACP"
 func (action Action) getPermission() Permission {
 	switch act := strings.Split(string(action), ":")[0]; act {
@@ -114,33 +104,104 @@ func (action Action) getPermission() Permission {
 }
 
 func NewIdentityAccessManagement(option *S3ApiServerOption) *IdentityAccessManagement {
+	return NewIdentityAccessManagementWithStore(option, "")
+}
+
+func NewIdentityAccessManagementWithStore(option *S3ApiServerOption, explicitStore string) *IdentityAccessManagement {
 	iam := &IdentityAccessManagement{
 		domain:       option.DomainName,
 		hashes:       make(map[string]*sync.Pool),
 		hashCounters: make(map[string]*int32),
 	}
+
+	// Always initialize credential manager with fallback to defaults
+	credentialManager, err := credential.NewCredentialManagerWithDefaults(credential.CredentialStoreTypeName(explicitStore))
+	if err != nil {
+		glog.Fatalf("failed to initialize credential manager: %v", err)
+	}
+
+	// For stores that need filer client details, set them
+	if store := credentialManager.GetStore(); store != nil {
+		if filerClientSetter, ok := store.(interface {
+			SetFilerClient(string, grpc.DialOption)
+		}); ok {
+			filerClientSetter.SetFilerClient(string(option.Filer), option.GrpcDialOption)
+		}
+	}
+
+	iam.credentialManager = credentialManager
+
+	// Track whether any configuration was successfully loaded
+	configLoaded := false
+
+	// First, try to load configurations from file or filer
 	if option.Config != "" {
+		glog.V(3).Infof("loading static config file %s", option.Config)
 		if err := iam.loadS3ApiConfigurationFromFile(option.Config); err != nil {
 			glog.Fatalf("fail to load config file %s: %v", option.Config, err)
 		}
+		configLoaded = true
 	} else {
+		glog.V(3).Infof("no static config file specified... loading config from credential manager")
 		if err := iam.loadS3ApiConfigurationFromFiler(option); err != nil {
 			glog.Warningf("fail to load config: %v", err)
+		} else {
+			// Check if any identities were actually loaded from filer
+			iam.m.RLock()
+			if len(iam.identities) > 0 {
+				configLoaded = true
+			}
+			iam.m.RUnlock()
 		}
 	}
+
+	// Only use environment variables as fallback if no configuration was loaded
+	if !configLoaded {
+		accessKeyId := os.Getenv("AWS_ACCESS_KEY_ID")
+		secretAccessKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+
+		if accessKeyId != "" && secretAccessKey != "" {
+			glog.V(0).Infof("No S3 configuration found, using AWS environment variables as fallback")
+
+			// Create environment variable identity name
+			identityNameSuffix := accessKeyId
+			if len(accessKeyId) > 8 {
+				identityNameSuffix = accessKeyId[:8]
+			}
+
+			// Create admin identity with environment variable credentials
+			envIdentity := &Identity{
+				Name:    "admin-" + identityNameSuffix,
+				Account: &AccountAdmin,
+				Credentials: []*Credential{
+					{
+						AccessKey: accessKeyId,
+						SecretKey: secretAccessKey,
+					},
+				},
+				Actions: []Action{
+					s3_constants.ACTION_ADMIN,
+				},
+			}
+
+			// Set as the only configuration
+			iam.m.Lock()
+			if len(iam.identities) == 0 {
+				iam.identities = []*Identity{envIdentity}
+				iam.accessKeyIdent = map[string]*Identity{accessKeyId: envIdentity}
+				iam.isAuthEnabled = true
+			}
+			iam.m.Unlock()
+
+			glog.V(0).Infof("Added admin identity from AWS environment variables: %s", envIdentity.Name)
+		}
+	}
+
 	return iam
 }
 
-func (iam *IdentityAccessManagement) loadS3ApiConfigurationFromFiler(option *S3ApiServerOption) (err error) {
-	var content []byte
-	err = pb.WithFilerClient(false, 0, option.Filer, option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		content, err = filer.ReadInsideFiler(client, filer.IamConfigDirectory, filer.IamIdentityFile)
-		return err
-	})
-	if err != nil {
-		return fmt.Errorf("read S3 config: %v", err)
-	}
-	return iam.LoadS3ApiConfigurationFromBytes(content)
+func (iam *IdentityAccessManagement) loadS3ApiConfigurationFromFiler(option *S3ApiServerOption) error {
+	return iam.LoadS3ApiConfigurationFromCredentialManager()
 }
 
 func (iam *IdentityAccessManagement) loadS3ApiConfigurationFromFile(fileName string) error {
@@ -156,7 +217,7 @@ func (iam *IdentityAccessManagement) LoadS3ApiConfigurationFromBytes(content []b
 	s3ApiConfiguration := &iam_pb.S3ApiConfiguration{}
 	if err := filer.ParseS3ConfigurationFromBytes(content, s3ApiConfiguration); err != nil {
 		glog.Warningf("unmarshal error: %v", err)
-		return fmt.Errorf("unmarshal error: %v", err)
+		return fmt.Errorf("unmarshal error: %w", err)
 	}
 
 	if err := filer.CheckDuplicateAccessKey(s3ApiConfiguration); err != nil {
@@ -179,6 +240,7 @@ func (iam *IdentityAccessManagement) loadS3ApiConfiguration(config *iam_pb.S3Api
 	foundAccountAnonymous := false
 
 	for _, account := range config.Accounts {
+		glog.V(3).Infof("loading account  name=%s, id=%s", account.DisplayName, account.Id)
 		switch account.Id {
 		case AccountAdmin.Id:
 			AccountAdmin = Account{
@@ -217,6 +279,7 @@ func (iam *IdentityAccessManagement) loadS3ApiConfiguration(config *iam_pb.S3Api
 		emailAccount[AccountAnonymous.EmailAddress] = &AccountAnonymous
 	}
 	for _, ident := range config.Identities {
+		glog.V(3).Infof("loading identity %s", ident.Name)
 		t := &Identity{
 			Name:        ident.Name,
 			Credentials: nil,
@@ -236,6 +299,7 @@ func (iam *IdentityAccessManagement) loadS3ApiConfiguration(config *iam_pb.S3Api
 				glog.Warningf("identity %s is associated with a non exist account ID, the association is invalid", ident.Name)
 			}
 		}
+
 		for _, action := range ident.Actions {
 			t.Actions = append(t.Actions, Action(action))
 		}
@@ -318,14 +382,10 @@ func (iam *IdentityAccessManagement) Auth(f http.HandlerFunc, action Action) htt
 
 		identity, errCode := iam.authRequest(r, action)
 		glog.V(3).Infof("auth error: %v", errCode)
+
 		if errCode == s3err.ErrNone {
 			if identity != nil && identity.Name != "" {
 				r.Header.Set(s3_constants.AmzIdentityId, identity.Name)
-				if identity.isAdmin() {
-					r.Header.Set(s3_constants.AmzIsAdmin, "true")
-				} else if _, ok := r.Header[s3_constants.AmzIsAdmin]; ok {
-					r.Header.Del(s3_constants.AmzIsAdmin)
-				}
 			}
 			f(w, r)
 			return
@@ -341,8 +401,6 @@ func (iam *IdentityAccessManagement) authRequest(r *http.Request, action Action)
 	var found bool
 	var authType string
 	switch getRequestAuthType(r) {
-	case authTypeStreamingSigned:
-		return identity, s3err.ErrNone
 	case authTypeUnknown:
 		glog.V(3).Infof("unknown auth type")
 		r.Header.Set(s3_constants.AmzAuthType, "Unknown")
@@ -351,13 +409,16 @@ func (iam *IdentityAccessManagement) authRequest(r *http.Request, action Action)
 		glog.V(3).Infof("v2 auth type")
 		identity, s3Err = iam.isReqAuthenticatedV2(r)
 		authType = "SigV2"
-	case authTypeSigned, authTypePresigned:
+	case authTypeStreamingSigned, authTypeSigned, authTypePresigned:
 		glog.V(3).Infof("v4 auth type")
 		identity, s3Err = iam.reqSignatureV4Verify(r)
 		authType = "SigV4"
 	case authTypePostPolicy:
 		glog.V(3).Infof("post policy auth type")
 		r.Header.Set(s3_constants.AmzAuthType, "PostPolicy")
+		return identity, s3err.ErrNone
+	case authTypeStreamingUnsigned:
+		glog.V(3).Infof("unsigned streaming upload")
 		return identity, s3err.ErrNone
 	case authTypeJWT:
 		glog.V(3).Infof("jwt auth type")
@@ -381,8 +442,14 @@ func (iam *IdentityAccessManagement) authRequest(r *http.Request, action Action)
 	}
 
 	glog.V(3).Infof("user name: %v actions: %v, action: %v", identity.Name, identity.Actions, action)
-
 	bucket, object := s3_constants.GetBucketAndObject(r)
+	prefix := s3_constants.GetPrefix(r)
+
+	if object == "/" && prefix != "" {
+		// Using the aws cli with s3, and s3api, and with boto3, the object is always set to "/"
+		// but the prefix is set to the actual object key
+		object = prefix
+	}
 
 	if !identity.canDo(action, bucket, object) {
 		return identity, s3err.ErrAccessDenied
@@ -401,6 +468,10 @@ func (iam *IdentityAccessManagement) authUser(r *http.Request) (*Identity, s3err
 	var authType string
 	switch getRequestAuthType(r) {
 	case authTypeStreamingSigned:
+		glog.V(3).Infof("signed streaming upload")
+		return identity, s3err.ErrNone
+	case authTypeStreamingUnsigned:
+		glog.V(3).Infof("unsigned streaming upload")
 		return identity, s3err.ErrNone
 	case authTypeUnknown:
 		glog.V(3).Infof("unknown auth type")
@@ -449,6 +520,10 @@ func (identity *Identity) canDo(action Action, bucket string, objectKey string) 
 		return true
 	}
 	for _, a := range identity.Actions {
+		// Case where the Resource provided is
+		// 	"Resource": [
+		//		"arn:aws:s3:::*"
+		//	]
 		if a == action {
 			return true
 		}
@@ -457,10 +532,12 @@ func (identity *Identity) canDo(action Action, bucket string, objectKey string) 
 		glog.V(3).Infof("identity %s is not allowed to perform action %s on %s -- bucket is empty", identity.Name, action, bucket+objectKey)
 		return false
 	}
+	glog.V(3).Infof("checking if %s can perform %s on bucket '%s'", identity.Name, action, bucket+objectKey)
 	target := string(action) + ":" + bucket + objectKey
 	adminTarget := s3_constants.ACTION_ADMIN + ":" + bucket + objectKey
 	limitedByBucket := string(action) + ":" + bucket
 	adminLimitedByBucket := s3_constants.ACTION_ADMIN + ":" + bucket
+
 	for _, a := range identity.Actions {
 		act := string(a)
 		if strings.HasSuffix(act, "*") {
@@ -485,10 +562,20 @@ func (identity *Identity) canDo(action Action, bucket string, objectKey string) 
 }
 
 func (identity *Identity) isAdmin() bool {
-	for _, a := range identity.Actions {
-		if a == "Admin" {
-			return true
-		}
+	return slices.Contains(identity.Actions, s3_constants.ACTION_ADMIN)
+}
+
+// GetCredentialManager returns the credential manager instance
+func (iam *IdentityAccessManagement) GetCredentialManager() *credential.CredentialManager {
+	return iam.credentialManager
+}
+
+// LoadS3ApiConfigurationFromCredentialManager loads configuration using the credential manager
+func (iam *IdentityAccessManagement) LoadS3ApiConfigurationFromCredentialManager() error {
+	s3ApiConfiguration, err := iam.credentialManager.LoadConfiguration(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to load configuration from credential manager: %w", err)
 	}
-	return false
+
+	return iam.loadS3ApiConfiguration(s3ApiConfiguration)
 }
